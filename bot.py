@@ -99,6 +99,7 @@ async def start(update, context):
         "📊 /saldo — Resumen del mes\n"
         "📦 /stock — Ver stock de insumos\n"
         "🛒 /solicitudes — Ver solicitudes pendientes\n"
+        "📅 /vencimientos — Ver vencimientos urgentes\n"
         "❌ /cancelar — Cancelar operación en curso",
         parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
     )
@@ -576,6 +577,141 @@ async def cmd_solicitudes(update, context):
     await update.message.reply_text(texto, parse_mode='Markdown')
 
 
+
+# ── REPORTE DIARIO DE VENCIMIENTOS ───────────────────────────────────
+def get_vencimientos_urgentes():
+    """Devuelve lista de alertas: vencidos o que vencen hoy/mañana."""
+    hoy = datetime.now().date()
+    manana = hoy + timedelta(days=1)
+    alertas = []
+
+    def clasif(fecha_str):
+        """Devuelve ('vencido'|'hoy'|'manana') o None."""
+        try:
+            f = datetime.strptime(fecha_str, '%Y-%m-%d').date()
+        except:
+            return None, None
+        if f < hoy:   return 'vencido', f
+        if f == hoy:  return 'hoy', f
+        if f == manana: return 'manana', f
+        return None, f
+
+    def icono(clase):
+        return {'vencido':'⛔','hoy':'🔴','manana':'🟡'}.get(clase,'')
+
+    # 1. Facturas CC proveedores
+    for doc in db.collection('egresos').stream():
+        d = doc.to_dict()
+        if d.get('pago') != 'Cuenta corriente': continue
+        pendiente = d.get('monto', 0) - (d.get('pagadoCC', 0) or 0)
+        if pendiente <= 0.001: continue
+        venc = d.get('vencimiento', '')
+        if not venc: continue
+        clase, f = clasif(venc)
+        if clase:
+            alertas.append(f"{icono(clase)} *Factura CC* — {d.get('proveedor','—')} ({d.get('factura','s/n')})" + "\n" + f"   💸 ${pendiente:,.0f} | Vence: {venc}")
+
+    # 2. Cheques propios disponibles
+    for doc in db.collection('chequesProp').stream():
+        d = doc.to_dict()
+        if d.get('estado') != 'Disponible': continue
+        clase, f = clasif(d.get('fpago', ''))
+        if clase:
+            alertas.append(f"{icono(clase)} *Cheque propio* N°{d.get('serie','—')}" + "\n" + f"   💸 ${d.get('monto',0):,.0f} | Vence: {d.get('fpago','')}")
+
+    # 3. Cheques de terceros disponibles (para depositar)
+    for doc in db.collection('ingresos').stream():
+        d = doc.to_dict()
+        chq = d.get('cheque', {})
+        if not chq or not chq.get('fpago'): continue
+        if (chq.get('estadoTercero') or 'Disponible') != 'Disponible': continue
+        clase, f = clasif(chq.get('fpago', ''))
+        if clase:
+            alertas.append(f"{icono(clase)} *Cheque de tercero* N°{chq.get('serie','—')} ({d.get('cliente','—')})" + "\n" + f"   💰 ${d.get('monto',0):,.0f} | Vence: {chq.get('fpago','')}")
+
+    # 4. Cuotas de créditos
+    cuotas_pagadas = {}
+    for doc in db.collection('cuotasPagadas').stream():
+        dp = doc.to_dict()
+        cid = dp.get('creditoId', '')
+        cuotas_pagadas[cid] = cuotas_pagadas.get(cid, 0) + 1
+
+    for doc in db.collection('creditos').stream():
+        d = doc.to_dict()
+        if d.get('activo') is False: continue
+        pagadas = cuotas_pagadas.get(d.get('id', ''), 0)
+        restantes = d.get('cuotas', 0) - pagadas
+        if restantes <= 0: continue
+        try:
+            finicio = datetime.strptime(d.get('finicio', ''), '%Y-%m-%d').date()
+            mes_base = finicio.year * 12 + finicio.month + pagadas - 1
+            f_prox = datetime(mes_base // 12, mes_base % 12 + 1, d.get('diaVto', 1)).date()
+        except:
+            continue
+        clase, f = clasif(f_prox.strftime('%Y-%m-%d'))
+        if clase:
+            alertas.append(f"{icono(clase)} *Cuota crédito* — {d.get('nombre','—')}" + "\n" + f"   💸 ${d.get('valorCuota',0):,.0f} | Vence: {f_prox}")
+
+    # 5. Cobros pendientes clientes (CCC)
+    for doc in db.collection('cuentasCorrientesCli').stream():
+        d = doc.to_dict()
+        pendiente = d.get('monto', 0) - (d.get('cobrado', 0) or 0)
+        if pendiente <= 0.001: continue
+        venc = d.get('vencimiento', '')
+        if not venc: continue
+        clase, f = clasif(venc)
+        if clase:
+            alertas.append(f"{icono(clase)} *Cobro cliente* — {d.get('cliente','—')}" + "\n" + f"   💰 ${pendiente:,.0f} | Vence: {venc}")
+
+    # 6. Presupuestos por vencer
+    for doc in db.collection('presupuestos').stream():
+        d = doc.to_dict()
+        if d.get('estado') != 'Pendiente': continue
+        fecha_pres = d.get('fecha', '')
+        validez = int(d.get('validez', 30) or 30)
+        if not fecha_pres: continue
+        try:
+            f_venc = datetime.strptime(fecha_pres, '%Y-%m-%d').date() + timedelta(days=validez)
+        except:
+            continue
+        clase, f = clasif(f_venc.strftime('%Y-%m-%d'))
+        if clase:
+            alertas.append(f"{icono(clase)} *Presupuesto* {d.get('num','—')} — {d.get('cliente','—')}" + "\n" + f"   Vence: {f_venc}")
+
+    return alertas
+
+
+async def reporte_vencimientos(context: ContextTypes.DEFAULT_TYPE):
+    """Se ejecuta todos los días a las 8am. Solo envía si hay algo urgente."""
+    alertas = get_vencimientos_urgentes()
+    if not alertas:
+        logger.info("Reporte diario: sin vencimientos urgentes hoy.")
+        return  # No molesta si no hay nada
+
+    hoy_str = datetime.now().strftime('%d/%m/%Y')
+    texto = f"📅 *Vencimientos urgentes — {hoy_str}*" + "\n_(vencidos o vencen hoy/mañana)_\n\n"
+    texto += "\n\n".join(alertas)
+    texto += f"\n\n_Total: {len(alertas)} alerta{'s' if len(alertas)>1 else ''}_"
+
+    try:
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=texto, parse_mode='Markdown')
+        logger.info(f"Reporte vencimientos enviado: {len(alertas)} alertas.")
+    except Exception as e:
+        logger.error(f"Error enviando reporte vencimientos: {e}")
+
+
+# ── /vencimientos (comando manual) ───────────────────────────────────
+async def cmd_vencimientos(update, context):
+    if not es_admin(update): return
+    alertas = get_vencimientos_urgentes()
+    if not alertas:
+        await update.message.reply_text("✅ No hay vencimientos urgentes para hoy ni mañana.")
+        return
+    hoy_str = datetime.now().strftime('%d/%m/%Y')
+    texto = f"📅 *Vencimientos urgentes — {hoy_str}*" + "\n\n"
+    texto += "\n\n".join(alertas)
+    await update.message.reply_text(texto, parse_mode='Markdown')
+
 # ── REPORTE SEMANAL ──────────────────────────────────────────────────
 async def reporte_semanal(context: ContextTypes.DEFAULT_TYPE):
     """Se ejecuta automáticamente los lunes a las 8am."""
@@ -693,6 +829,7 @@ def main():
     app.add_handler(CommandHandler("saldo", cmd_saldo))
     app.add_handler(CommandHandler("stock", cmd_stock))
     app.add_handler(CommandHandler("solicitudes", cmd_solicitudes))
+    app.add_handler(CommandHandler("vencimientos", cmd_vencimientos))
     app.add_handler(conv_ingreso)
     app.add_handler(conv_egreso)
     app.add_handler(conv_sueldo)
@@ -712,6 +849,12 @@ def main():
     job_queue.run_repeating(reporte_semanal, interval=604800, first=first_delay,
                             name="reporte_semanal")
     logger.info(f"Reporte semanal programado: primer envío en {first_delay/3600:.1f} horas.")
+
+    # ── Reporte diario vencimientos: todos los días a las 08:00 ─────
+    from datetime import time as dtime
+    job_queue.run_daily(reporte_vencimientos, time=dtime(hour=8, minute=0, second=0),
+                        name="reporte_vencimientos")
+    logger.info("Reporte diario de vencimientos programado: 08:00 todos los días.")
 
     # ── Listener Firestore para notificaciones en tiempo real ────────
     iniciar_listener_notificaciones(app)
