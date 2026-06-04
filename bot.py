@@ -1,6 +1,6 @@
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 import firebase_admin
@@ -8,6 +8,7 @@ from firebase_admin import credentials, firestore
 import json
 import random
 import string
+import threading
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID"))
@@ -96,6 +97,8 @@ async def start(update, context):
         "🏗️ /proyecto — Crear nuevo proyecto\n"
         "📋 /proyectos — Ver proyectos activos\n"
         "📊 /saldo — Resumen del mes\n"
+        "📦 /stock — Ver stock de insumos\n"
+        "🛒 /solicitudes — Ver solicitudes pendientes\n"
         "❌ /cancelar — Cancelar operación en curso",
         parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
     )
@@ -484,6 +487,148 @@ async def handle_texto(update, context):
         "No entendí ese mensaje.\n\n/ingreso · /egreso · /sueldo · /proyecto · /proyectos · /saldo\n\nO /start para ver la ayuda.",
         reply_markup=ReplyKeyboardRemove())
 
+# ── NOTIFICACIONES FIRESTORE ─────────────────────────────────────────
+# El bot escucha la colección `notificacionesBot` y manda el mensaje al admin.
+# Los documentos tienen: { tipo, mensaje, leido, ts }
+# El HTML escribe ahí cuando hay solicitud de insumo o alerta de stock.
+
+_bot_app_ref = None  # referencia global a la Application de telegram
+
+def iniciar_listener_notificaciones(app):
+    """Lanza un hilo que escucha Firestore y envía mensajes a Telegram."""
+    global _bot_app_ref
+    _bot_app_ref = app
+
+    def on_snapshot(col_snapshot, changes, read_time):
+        for change in changes:
+            if change.type.name != 'ADDED':
+                continue
+            doc = change.document
+            data = doc.to_dict()
+            if data.get('leido'):
+                continue
+            mensaje = data.get('mensaje', '')
+            if not mensaje:
+                continue
+            # Marcar como leído antes de enviar (evita duplicados)
+            doc.reference.update({'leido': True})
+            # Enviar al admin via Telegram (threadsafe)
+            import asyncio
+            loop = app.bot._request._loop if hasattr(app.bot, '_request') else None
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    app.bot.send_message(
+                        chat_id=ADMIN_CHAT_ID,
+                        text=mensaje,
+                        parse_mode='Markdown'
+                    ),
+                    app.update_queue._loop if hasattr(app.update_queue, '_loop') else asyncio.get_event_loop()
+                )
+            except Exception as e:
+                logger.error(f"Error enviando notif Telegram: {e}")
+
+    col_ref = db.collection('notificacionesBot')
+    col_ref.on_snapshot(on_snapshot)
+    logger.info("Listener notificaciones Firestore activo.")
+
+
+# ── /stock ───────────────────────────────────────────────────────────
+async def cmd_stock(update, context):
+    if not es_admin(update): return
+    insumos = [d.to_dict() for d in db.collection('insumos').stream()
+               if d.to_dict().get('activo', True) is not False]
+    if not insumos:
+        await update.message.reply_text("📦 No hay insumos registrados.")
+        return
+    bajo = [i for i in insumos if i.get('stockmin', 0) > 0 and (i.get('stock', 0) or 0) < i.get('stockmin', 0)]
+    ok   = [i for i in insumos if i not in bajo]
+    texto = "📦 *Stock de Insumos*\n\n"
+    if bajo:
+        texto += f"⚠️ *BAJO MÍNIMO ({len(bajo)}):*\n"
+        for i in bajo:
+            texto += f"  🔴 {i.get('nombre','—')}: {i.get('stock',0)} {i.get('unidad','')} (mín: {i.get('stockmin',0)})\n"
+        texto += "\n"
+    texto += f"✅ *En stock ({len(ok)}):*\n"
+    for i in ok[:15]:  # máx 15 para no superar límite Telegram
+        texto += f"  🟢 {i.get('nombre','—')}: {i.get('stock',0)} {i.get('unidad','')}\n"
+    if len(ok) > 15:
+        texto += f"  _(y {len(ok)-15} más...)_\n"
+    await update.message.reply_text(texto, parse_mode='Markdown')
+
+
+# ── /solicitudes ─────────────────────────────────────────────────────
+async def cmd_solicitudes(update, context):
+    if not es_admin(update): return
+    docs = list(db.collection('solicitudesInsumos')
+                .where('atendida', '==', False)
+                .order_by('ts', direction=firestore.Query.DESCENDING)
+                .limit(20).stream())
+    if not docs:
+        await update.message.reply_text("✅ No hay solicitudes de insumos pendientes.")
+        return
+    texto = f"🛒 *Solicitudes pendientes ({len(docs)})*\n\n"
+    for d in docs:
+        s = d.to_dict()
+        texto += (f"📦 *{s.get('insumoNombre','—')}*\n"
+                  f"   👷 {s.get('empleado','—')} · 🏗️ {s.get('proyecto','—')}\n"
+                  f"   📅 {s.get('fecha','—')} | Cant: {s.get('cantidad',1)} {s.get('unidad','')}\n"
+                  f"   📝 {s.get('obs','') or '—'}\n\n")
+    await update.message.reply_text(texto, parse_mode='Markdown')
+
+
+# ── REPORTE SEMANAL ──────────────────────────────────────────────────
+async def reporte_semanal(context: ContextTypes.DEFAULT_TYPE):
+    """Se ejecuta automáticamente los lunes a las 8am."""
+    ahora = datetime.now()
+    hace7 = ahora - timedelta(days=7)
+    fecha_desde = hace7.strftime('%Y-%m-%d')
+
+    # Movimientos de la semana
+    movs = [d.to_dict() for d in db.collection('movimientosInsumos').stream()]
+    semana = [m for m in movs if m.get('fecha', '') >= fecha_desde]
+    consumos  = [m for m in semana if m.get('tipo') == 'consumo']
+    reposiciones = [m for m in semana if m.get('tipo') == 'reposicion']
+
+    # Insumos bajo mínimo
+    insumos = [d.to_dict() for d in db.collection('insumos').stream()
+               if d.to_dict().get('activo', True) is not False]
+    bajo = [i for i in insumos if i.get('stockmin', 0) > 0 and (i.get('stock', 0) or 0) < i.get('stockmin', 0)]
+
+    # Solicitudes pendientes
+    sols = list(db.collection('solicitudesInsumos').where('atendida', '==', False).stream())
+
+    texto = (
+        f"📊 *Reporte semanal de insumos*\n"
+        f"_{fecha_desde} → {ahora.strftime('%Y-%m-%d')}_\n\n"
+        f"📤 Consumos registrados: *{len(consumos)}*\n"
+        f"📥 Reposiciones: *{len(reposiciones)}*\n"
+    )
+
+    if bajo:
+        texto += f"\n⚠️ *Insumos bajo mínimo ({len(bajo)}):*\n"
+        for i in bajo:
+            texto += f"  🔴 {i.get('nombre','—')}: {i.get('stock',0)}/{i.get('stockmin',0)} {i.get('unidad','')}\n"
+    else:
+        texto += "\n✅ Todos los insumos con stock suficiente.\n"
+
+    if sols:
+        texto += f"\n🛒 Solicitudes pendientes: *{len(sols)}*\n_Usá /solicitudes para verlas._\n"
+
+    if consumos:
+        # Top 5 insumos más consumidos
+        from collections import Counter
+        conteo = Counter(m.get('insumoNombre','?') for m in consumos)
+        texto += f"\n🔝 *Más usados esta semana:*\n"
+        for nombre, cant in conteo.most_common(5):
+            texto += f"  · {nombre}: {cant} consumo{'s' if cant>1 else ''}\n"
+
+    try:
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=texto, parse_mode='Markdown')
+        logger.info("Reporte semanal enviado.")
+    except Exception as e:
+        logger.error(f"Error enviando reporte semanal: {e}")
+
+
 # ── MAIN ────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TOKEN).build()
@@ -546,6 +691,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("proyectos", cmd_proyectos))
     app.add_handler(CommandHandler("saldo", cmd_saldo))
+    app.add_handler(CommandHandler("stock", cmd_stock))
+    app.add_handler(CommandHandler("solicitudes", cmd_solicitudes))
     app.add_handler(conv_ingreso)
     app.add_handler(conv_egreso)
     app.add_handler(conv_sueldo)
@@ -553,6 +700,23 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_foto))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_texto))
 
+    # ── Reporte semanal: lunes a las 08:00 ──────────────────────────
+    job_queue = app.job_queue
+    # Calcular segundos hasta el próximo lunes 8am
+    ahora = datetime.now()
+    dias_hasta_lunes = (7 - ahora.weekday()) % 7  # 0=lunes
+    if dias_hasta_lunes == 0 and ahora.hour >= 8:
+        dias_hasta_lunes = 7
+    proximo_lunes = ahora.replace(hour=8, minute=0, second=0, microsecond=0) + timedelta(days=dias_hasta_lunes)
+    first_delay = (proximo_lunes - ahora).total_seconds()
+    job_queue.run_repeating(reporte_semanal, interval=604800, first=first_delay,
+                            name="reporte_semanal")
+    logger.info(f"Reporte semanal programado: primer envío en {first_delay/3600:.1f} horas.")
+
+    # ── Listener Firestore para notificaciones en tiempo real ────────
+    iniciar_listener_notificaciones(app)
+
+    # ── Actualizar /start con nuevos comandos ────────────────────────
     logger.info("Bot PEGASO iniciado...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
